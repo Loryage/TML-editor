@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-TML Markdown Editor - 性能优化版
-移除了 MathJax 和 Mermaid，添加预览防抖，大幅提升响应速度
-保留悬停放大功能
+TML Markdown Editor 
+主程序代码，现已支持多端同步
+依赖见requirements.txt
 """
 
 import sys
@@ -23,6 +23,7 @@ if False:
     import markdown.extensions.tables
     import markdown.extensions.fenced_code
     import docx
+    import requests
     from PyQt6.QtWebEngineWidgets import QWebEngineView
     from PyQt6.QtWebEngineCore import QWebEngineSettings
     from PyQt6.QtWebChannel import QWebChannel
@@ -30,9 +31,13 @@ if False:
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QSplitter, QTextEdit,
     QFileDialog, QMessageBox, QMenuBar, QMenu,
-    QToolBar, QStatusBar, QWidget, QVBoxLayout,
-    QTabWidget, QDialog, QPushButton, QSplashScreen
+    QStatusBar, QWidget, QVBoxLayout, QHBoxLayout,
+    QTabWidget, QDialog, QPushButton, QSplashScreen,
+    QLabel, QLineEdit, QFormLayout, QDialogButtonBox,
+    QProgressBar, QCheckBox, QListWidget, QListWidgetItem,
+    QAbstractItemView, QFrame
 )
+from PyQt6.QtCore import QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QFont, QSyntaxHighlighter, QTextCharFormat, QColor, QIcon, QTextCursor, QPixmap, QPainter, QLinearGradient
 from PyQt6.QtCore import Qt, QFileInfo, QUrl, QObject, pyqtSignal, pyqtSlot, QTimer
 
@@ -75,6 +80,22 @@ class StartupLogger:
 
 
 STARTUP_LOGGER = StartupLogger()
+
+
+# ==================== 同步工作线程 ====================
+class SyncWorker(QThread):
+    progress_signal = pyqtSignal(str, int)
+    finished_signal = pyqtSignal(dict)
+
+    def __init__(self, sync_client):
+        super().__init__()
+        self.sync_client = sync_client
+
+    def run(self):
+        def on_progress(message, percent):
+            self.progress_signal.emit(message, percent)
+        result = self.sync_client.sync(progress_callback=on_progress)
+        self.finished_signal.emit(result)
 
 
 def get_markdown_module():
@@ -187,6 +208,236 @@ class SplashScreen(QSplashScreen):
         self.setPixmap(pixmap)
 
 
+# ==================== 配置与最近文件管理 ====================
+def get_app_config_dir() -> str:
+    if os.name == "nt":
+        base = os.environ.get("APPDATA", os.path.expanduser("~"))
+    else:
+        base = os.path.expanduser("~/.config")
+    app_dir = os.path.join(base, "TMLEditor")
+    os.makedirs(app_dir, exist_ok=True)
+    return app_dir
+
+
+def get_settings_path() -> str:
+    return os.path.join(get_app_config_dir(), "settings.json")
+
+
+def load_settings() -> dict:
+    path = get_settings_path()
+    default = {
+        "show_quick_open_on_start": True,
+        "recent_files": [],
+    }
+    if os.path.exists(path):
+        try:
+            import json
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            for k, v in default.items():
+                if k not in data:
+                    data[k] = v
+            return data
+        except Exception:
+            pass
+    return dict(default)
+
+
+def save_settings(settings: dict):
+    path = get_settings_path()
+    try:
+        import json
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def get_recent_files() -> list:
+    settings = load_settings()
+    return settings.get("recent_files", [])
+
+
+def add_recent_file(file_path: str):
+    settings = load_settings()
+    recent = settings.get("recent_files", [])
+    recent = [r for r in recent if r.get("path") != file_path]
+    recent.insert(0, {
+        "path": file_path,
+        "name": os.path.basename(file_path),
+        "time": int(time.time())
+    })
+    recent = recent[:20]
+    settings["recent_files"] = recent
+    save_settings(settings)
+
+
+def remove_recent_file(file_path: str):
+    settings = load_settings()
+    recent = [r for r in settings.get("recent_files", []) if r.get("path") != file_path]
+    settings["recent_files"] = recent
+    save_settings(settings)
+
+
+# ==================== 快速打开对话框 ====================
+class QuickOpenDialog(QDialog):
+    def __init__(self, sync_folder: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("快速打开")
+        self.resize(520, 420)
+        self.selected_path = None
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        title = QLabel("选择要打开的文件")
+        title_font = QFont()
+        title_font.setPointSize(12)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        layout.addWidget(title)
+
+        content_layout = QHBoxLayout()
+        content_layout.setSpacing(12)
+
+        # 左侧：同步文件夹文件
+        left_layout = QVBoxLayout()
+        left_label = QLabel("同步文件夹")
+        left_label.setStyleSheet("color: #666; font-weight: bold;")
+        left_layout.addWidget(left_label)
+
+        self.folder_list = QListWidget()
+        self.folder_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.folder_list.itemDoubleClicked.connect(self._on_folder_double_click)
+        left_layout.addWidget(self.folder_list)
+
+        left_frame = QFrame()
+        left_frame.setLayout(left_layout)
+        content_layout.addWidget(left_frame, 1)
+
+        # 右侧：最近文件
+        right_layout = QVBoxLayout()
+        right_label = QLabel("最近打开")
+        right_label.setStyleSheet("color: #666; font-weight: bold;")
+        right_layout.addWidget(right_label)
+
+        self.recent_list = QListWidget()
+        self.recent_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.recent_list.itemDoubleClicked.connect(self._on_recent_double_click)
+        right_layout.addWidget(self.recent_list)
+
+        right_frame = QFrame()
+        right_frame.setLayout(right_layout)
+        content_layout.addWidget(right_frame, 1)
+
+        layout.addLayout(content_layout, 1)
+
+        # 底部：不再显示 + 按钮
+        bottom_layout = QHBoxLayout()
+        self.dont_show_check = QCheckBox("启动时不再显示此窗口")
+        bottom_layout.addWidget(self.dont_show_check)
+        bottom_layout.addStretch()
+
+        btn_new = QPushButton("新建文档")
+        btn_new.clicked.connect(self._on_new_clicked)
+        bottom_layout.addWidget(btn_new)
+
+        btn_open = QPushButton("打开其他文件...")
+        btn_open.clicked.connect(self._on_open_other_clicked)
+        bottom_layout.addWidget(btn_open)
+
+        btn_cancel = QPushButton("取消")
+        btn_cancel.clicked.connect(self.reject)
+        bottom_layout.addWidget(btn_cancel)
+
+        layout.addLayout(bottom_layout)
+
+        # 加载数据
+        self._load_folder_files(sync_folder)
+        self._load_recent_files()
+
+        # 默认选中第一个存在的列表
+        if self.folder_list.count() > 0:
+            self.folder_list.setCurrentRow(0)
+        elif self.recent_list.count() > 0:
+            self.recent_list.setCurrentRow(0)
+
+    def _load_folder_files(self, sync_folder: str):
+        if not sync_folder or not os.path.exists(sync_folder):
+            item = QListWidgetItem("（未配置同步文件夹）")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.folder_list.addItem(item)
+            return
+
+        try:
+            files = []
+            for name in os.listdir(sync_folder):
+                full_path = os.path.join(sync_folder, name)
+                if os.path.isfile(full_path) and name.lower().endswith(('.md', '.txt', '.text', '.json', '.yaml', '.yml')):
+                    mtime = os.path.getmtime(full_path)
+                    files.append((name, full_path, mtime))
+            files.sort(key=lambda x: x[2], reverse=True)
+
+            if not files:
+                item = QListWidgetItem("（文件夹为空）")
+                item.setFlags(Qt.ItemFlag.NoItemFlags)
+                self.folder_list.addItem(item)
+                return
+
+            for name, full_path, mtime in files[:30]:
+                item = QListWidgetItem(name)
+                item.setData(Qt.ItemDataRole.UserRole, full_path)
+                item.setToolTip(full_path)
+                self.folder_list.addItem(item)
+        except Exception as e:
+            item = QListWidgetItem(f"（读取失败：{str(e)}）")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.folder_list.addItem(item)
+
+    def _load_recent_files(self):
+        recent = get_recent_files()
+        if not recent:
+            item = QListWidgetItem("（暂无记录）")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.recent_list.addItem(item)
+            return
+
+        for r in recent:
+            path = r.get("path", "")
+            name = r.get("name", os.path.basename(path))
+            exists = os.path.exists(path)
+            item = QListWidgetItem(name)
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setToolTip(path)
+            if not exists:
+                item.setForeground(QColor("#999"))
+                item.setText(f"{name} （已不存在）")
+            self.recent_list.addItem(item)
+
+    def _on_folder_double_click(self, item):
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if path and os.path.isfile(path):
+            self.selected_path = path
+            self.accept()
+
+    def _on_recent_double_click(self, item):
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if path and os.path.isfile(path):
+            self.selected_path = path
+            self.accept()
+
+    def _on_new_clicked(self):
+        self.selected_path = None
+        self.done(2)
+
+    def _on_open_other_clicked(self):
+        self.selected_path = None
+        self.done(3)
+
+    def dont_show_again(self) -> bool:
+        return self.dont_show_check.isChecked()
+
+
 # ==================== Markdown 语法高亮器（优化版） ====================
 class MarkdownHighlighter(QSyntaxHighlighter):
     # 类常量：限制高亮的最大行数，避免大文件卡顿
@@ -270,12 +521,9 @@ class CodeEditor(QTextEdit):
 
     def load_file(self, path):
         try:
-            with open(path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            # 禁用高亮，使用批量编辑避免频繁触发
+            content = self._read_file_with_fallback(path)
             self.set_markdown_highlighting(False)
             self._is_loading = True
-            # 使用批量编辑提升大文件加载速度
             cursor = self.textCursor()
             cursor.beginEditBlock()
             cursor.select(QTextCursor.SelectionType.Document)
@@ -284,7 +532,6 @@ class CodeEditor(QTextEdit):
             cursor.endEditBlock()
             self.file_path = path
             self._is_loading = False
-            # 延迟启用高亮，给UI一个喘息的机会
             QTimer.singleShot(50, lambda: self.set_markdown_highlighting(self.is_markdown_path(path)))
             self.document().setModified(False)
             return True
@@ -292,6 +539,43 @@ class CodeEditor(QTextEdit):
             self._is_loading = False
             QMessageBox.critical(self, "错误", f"无法打开文件：{str(e)}")
             return False
+
+    @staticmethod
+    def _read_file_with_fallback(path):
+        with open(path, 'rb') as f:
+            raw = f.read()
+        if raw.startswith(b'\xff\xfe'):
+            try:
+                return raw.decode('utf-16-le')
+            except Exception:
+                pass
+        elif raw.startswith(b'\xfe\xff'):
+            try:
+                return raw.decode('utf-16-be')
+            except Exception:
+                pass
+        elif raw.startswith(b'\xef\xbb\xbf'):
+            try:
+                return raw.decode('utf-8-sig')
+            except Exception:
+                pass
+        if len(raw) >= 2:
+            null_count = raw.count(b'\x00')
+            if null_count > len(raw) * 0.2:
+                try:
+                    return raw.decode('utf-16-le')
+                except Exception:
+                    try:
+                        return raw.decode('utf-16-be')
+                    except Exception:
+                        pass
+        encodings = ['utf-8', 'utf-8-sig', 'utf-16', 'utf-16-le', 'gbk', 'gb2312', 'gb18030', 'latin-1']
+        for encoding in encodings:
+            try:
+                return raw.decode(encoding)
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+        return raw.decode('utf-8', errors='replace')
 
     def save_to_path(self, path):
         try:
@@ -538,11 +822,57 @@ class MarkdownEditor(QMainWindow):
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("就绪")
 
+        # 状态栏同步状态指示
+        self.sync_status_label = QLabel("")
+        self.sync_status_label.setStyleSheet("color: #888; padding: 0 8px;")
+        self.status_bar.addPermanentWidget(self.sync_status_label)
+
+        self.init_sync_client()
+        QTimer.singleShot(500, self.refresh_sync_status)
+
+        # 自动同步定时器（每60秒）
+        self.auto_sync_timer = QTimer(self)
+        self.auto_sync_timer.timeout.connect(self._auto_sync_tick)
+        self._is_sync_running = False
+        self._current_sync_worker = None
+        self._setup_auto_sync()
+
+        # 同步状态旋转动画
+        self._sync_spin_angle = 0
+        self._sync_spin_timer = QTimer(self)
+        self._sync_spin_timer.timeout.connect(self._update_sync_spin)
+        self._sync_spin_timer.setInterval(50)
+
         if self.startup_paths:
             QTimer.singleShot(0, self.open_startup_files)
         else:
-            self.new_tab()
+            settings = load_settings()
+            if settings.get("show_quick_open_on_start", True):
+                QTimer.singleShot(100, self._show_quick_open_dialog)
+            else:
+                self.new_tab()
         log_startup("window init end")
+
+    def _show_quick_open_dialog(self):
+        sync_folder = ""
+        if hasattr(self, "sync_folder") and self.sync_folder:
+            sync_folder = self.sync_folder
+        dialog = QuickOpenDialog(sync_folder, self)
+        result = dialog.exec()
+
+        if dialog.dont_show_again():
+            settings = load_settings()
+            settings["show_quick_open_on_start"] = False
+            save_settings(settings)
+
+        if result == 1 and dialog.selected_path:
+            self.open_file(dialog.selected_path)
+        elif result == 2:
+            self.new_tab()
+        elif result == 3:
+            self.open_file()
+        else:
+            self.new_tab()
 
     def open_startup_files(self):
         log_startup(f"opening startup files: {len(self.startup_paths)}")
@@ -751,6 +1081,10 @@ class MarkdownEditor(QMainWindow):
                 continue
             opened_any = True
             self.status_bar.showMessage(f"已打开：{path}")
+            try:
+                add_recent_file(path)
+            except Exception:
+                pass
 
         if opened_any:
             current = self.current_editor()
@@ -887,7 +1221,10 @@ pre {{ background: #fee2e2; padding: 12px; border-radius: 6px; overflow-x: auto;
     def new_file(self):
         self.new_tab()
 
-    def open_file(self):
+    def open_file(self, path: str = ""):
+        if path:
+            self.open_file_paths([path])
+            return
         path, _ = QFileDialog.getOpenFileName(
             self, "打开文件", "",
             "文本文件 (*.txt *.md *.markdown *.tex);;所有文件 (*)"
@@ -1057,6 +1394,232 @@ pre {{ background: #fee2e2; padding: 12px; border-radius: 6px; overflow-x: auto;
         dialog.setLayout(layout)
         dialog.exec()
 
+    # ========== 同步功能 ==========
+    def init_sync_client(self):
+        try:
+            from sync_client import SyncClient, get_sync_folder
+            self.sync_client = SyncClient()
+            self.sync_folder = get_sync_folder()
+        except Exception as e:
+            self.sync_client = None
+            self.sync_folder = None
+
+    def sync_now(self):
+        if not hasattr(self, "sync_client") or self.sync_client is None:
+            self.init_sync_client()
+        if not self.sync_client.is_configured():
+            QMessageBox.information(self, "同步设置", "请先配置服务器信息")
+            self.open_sync_settings()
+            return
+        self.run_sync()
+
+    def open_sync_settings(self):
+        if not hasattr(self, "sync_client") or self.sync_client is None:
+            self.init_sync_client()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("同步设置")
+        dialog.setFixedWidth(420)
+        layout = QFormLayout()
+
+        server_edit = QLineEdit(self.sync_client.server_url)
+        api_key_edit = QLineEdit(self.sync_client.api_key)
+        api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        folder_label = QLabel(self.sync_folder)
+
+        auto_sync_check = QCheckBox("每60秒自动同步一次")
+        auto_sync_check.setChecked(self.sync_client.config.get("auto_sync", False))
+
+        layout.addRow("服务器地址：", server_edit)
+        layout.addRow("API Key：", api_key_edit)
+        layout.addRow("同步文件夹：", folder_label)
+        layout.addRow("自动同步：", auto_sync_check)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addRow(buttons)
+
+        dialog.setLayout(layout)
+
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.sync_client.config["server_url"] = server_edit.text().strip()
+            self.sync_client.config["api_key"] = api_key_edit.text().strip()
+            self.sync_client.config["auto_sync"] = auto_sync_check.isChecked()
+            from sync_client import save_sync_config
+            save_sync_config(self.sync_client.config)
+            QMessageBox.information(self, "设置已保存", "同步设置已保存")
+            self._setup_auto_sync()
+            self.refresh_sync_status()
+
+    def open_sync_folder(self):
+        if not hasattr(self, "sync_client") or self.sync_client is None:
+            self.init_sync_client()
+        folder = self.sync_folder
+        if folder and os.path.exists(folder):
+            try:
+                if os.name == "nt":
+                    os.startfile(folder)
+                else:
+                    import subprocess
+                    subprocess.Popen(["xdg-open", folder])
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"无法打开文件夹：{str(e)}")
+        else:
+            QMessageBox.information(self, "提示", "同步文件夹不存在")
+
+    def refresh_sync_status(self):
+        if not hasattr(self, "sync_client") or self.sync_client is None:
+            return
+        if self._is_sync_running:
+            return
+        if self.sync_client.is_configured():
+            last_sync = self.sync_client.config.get("last_sync_time", 0)
+            auto_on = self.sync_client.config.get("auto_sync", False)
+            auto_tag = " | 自动同步已开启" if auto_on else ""
+            if last_sync > 0:
+                import datetime
+                dt = datetime.datetime.fromtimestamp(last_sync / 1000)
+                self.status_bar.showMessage(f"同步已配置 | 上次同步：{dt.strftime('%Y-%m-%d %H:%M')}{auto_tag}")
+            else:
+                self.status_bar.showMessage(f"同步已配置 | 尚未同步{auto_tag}")
+            self.sync_status_label.setText("🔄 同步就绪")
+            self.sync_status_label.setStyleSheet("color: #888; padding: 0 8px;")
+        else:
+            self.status_bar.showMessage("同步未配置")
+            self.sync_status_label.setText("")
+
+    def _start_sync_indicator(self):
+        self._is_sync_running = True
+        self._sync_spin_angle = 0
+        self._sync_spin_timer.start()
+        self.sync_status_label.setStyleSheet("color: #2196F3; padding: 0 8px; font-weight: bold;")
+        self._update_sync_spin()
+
+    def _stop_sync_indicator(self, success=True):
+        self._is_sync_running = False
+        self._sync_spin_timer.stop()
+        if success:
+            self.sync_status_label.setText("✅ 同步完成")
+            self.sync_status_label.setStyleSheet("color: #4CAF50; padding: 0 8px;")
+        else:
+            self.sync_status_label.setText("❌ 同步失败")
+            self.sync_status_label.setStyleSheet("color: #f44336; padding: 0 8px;")
+        QTimer.singleShot(3000, self._reset_sync_label)
+
+    def _reset_sync_label(self):
+        if not self._is_sync_running:
+            self.refresh_sync_status()
+
+    def _update_sync_spin(self):
+        self._sync_spin_angle = (self._sync_spin_angle + 15) % 360
+        chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        idx = (self._sync_spin_angle // 36) % len(chars)
+        self.sync_status_label.setText(f"{chars[idx]} 同步中...")
+
+    def _setup_auto_sync(self):
+        """根据配置启动或停止自动同步定时器"""
+        if not hasattr(self, "sync_client") or self.sync_client is None:
+            return
+        auto_on = self.sync_client.config.get("auto_sync", False)
+        if auto_on and self.sync_client.is_configured():
+            self.auto_sync_timer.start(60000)
+        else:
+            self.auto_sync_timer.stop()
+
+    def _auto_sync_tick(self):
+        """自动同步触发：静默执行，不弹对话框"""
+        if self._is_sync_running:
+            return
+        if not hasattr(self, "sync_client") or self.sync_client is None:
+            return
+        if not self.sync_client.is_configured():
+            return
+        self._run_sync_worker(show_dialog=False)
+
+    def _run_sync_worker(self, show_dialog=True):
+        """统一的同步执行入口，管理 worker 生命周期"""
+        if self._is_sync_running:
+            return
+        if self._current_sync_worker is not None:
+            return
+
+        try:
+            self._start_sync_indicator()
+            worker = SyncWorker(self.sync_client)
+            self._current_sync_worker = worker
+
+            progress_dialog = None
+            status_label = None
+            progress_bar = None
+
+            if show_dialog:
+                progress_dialog = QDialog(self)
+                progress_dialog.setWindowTitle("正在同步")
+                progress_dialog.setFixedSize(360, 120)
+                layout = QVBoxLayout()
+                status_label = QLabel("准备同步...")
+                progress_bar = QProgressBar()
+                progress_bar.setRange(0, 100)
+                progress_bar.setValue(0)
+                layout.addWidget(status_label)
+                layout.addWidget(progress_bar)
+                progress_dialog.setLayout(layout)
+                progress_dialog.show()
+
+            def update_progress(message, percent):
+                try:
+                    if status_label and progress_bar and progress_dialog and progress_dialog.isVisible():
+                        status_label.setText(message)
+                        progress_bar.setValue(percent)
+                except Exception:
+                    pass
+
+            def on_finished(result):
+                try:
+                    self._stop_sync_indicator(success=result.get("success", False))
+                    if progress_dialog and progress_dialog.isVisible():
+                        progress_dialog.accept()
+                    if result.get("success"):
+                        if show_dialog:
+                            QMessageBox.information(self, "同步完成", result.get("message", "同步成功"))
+                        else:
+                            self.status_bar.showMessage(result.get("message", "自动同步完成"), 5000)
+                        self.refresh_sync_status()
+                    else:
+                        if show_dialog:
+                            QMessageBox.warning(self, "同步失败", result.get("message", "未知错误"))
+                        else:
+                            self.status_bar.showMessage(f"自动同步失败：{result.get('message', '未知错误')}", 5000)
+                except Exception as e:
+                    log_startup(f"sync on_finished error: {e}")
+                finally:
+                    QTimer.singleShot(100, self._cleanup_sync_worker)
+
+            worker.progress_signal.connect(update_progress)
+            worker.finished_signal.connect(on_finished)
+            worker.start()
+        except Exception as e:
+            log_startup(f"start sync error: {e}")
+            self._is_sync_running = False
+            self._current_sync_worker = None
+            self._sync_spin_timer.stop()
+            self.refresh_sync_status()
+
+    def _cleanup_sync_worker(self):
+        """安全清理 worker 引用"""
+        try:
+            if self._current_sync_worker is not None:
+                self._current_sync_worker.deleteLater()
+                self._current_sync_worker = None
+        except Exception as e:
+            log_startup(f"cleanup sync worker error: {e}")
+            self._current_sync_worker = None
+
+    def run_sync(self):
+        self._run_sync_worker(show_dialog=True)
+
     # ========== 界面构建 ==========
     def create_menu_bar(self):
         menubar = self.menuBar()
@@ -1105,6 +1668,29 @@ pre {{ background: #fee2e2; padding: 12px; border-radius: 6px; overflow-x: auto;
         self.split_action.triggered.connect(self.toggle_split_mode)
         view_menu.addAction(self.split_action)
 
+        sync_menu = menubar.addMenu("同步(&S)")
+        sync_now_action = QAction("立即同步(&Y)", self)
+        sync_now_action.triggered.connect(self.sync_now)
+        sync_now_action.setShortcut("Ctrl+Shift+S")
+        sync_menu.addAction(sync_now_action)
+
+        sync_menu.addSeparator()
+
+        sync_folder_action = QAction("打开同步文件夹(&O)", self)
+        sync_folder_action.triggered.connect(self.open_sync_folder)
+        sync_menu.addAction(sync_folder_action)
+
+        sync_settings_action = QAction("同步设置(&T)...", self)
+        sync_settings_action.triggered.connect(self.open_sync_settings)
+        sync_menu.addAction(sync_settings_action)
+
+        settings_menu = menubar.addMenu("设置(&E)")
+        quick_start_action = QAction("启动时显示快速打开窗口", self)
+        quick_start_action.setCheckable(True)
+        quick_start_action.setChecked(load_settings().get("show_quick_open_on_start", True))
+        quick_start_action.triggered.connect(self._toggle_quick_open_start)
+        settings_menu.addAction(quick_start_action)
+
         help_menu = menubar.addMenu("帮助(&H)")
         help_action = QAction("使用指导(&G)", self)
         help_action.triggered.connect(self.show_help)
@@ -1117,6 +1703,11 @@ pre {{ background: #fee2e2; padding: 12px; border-radius: 6px; overflow-x: auto;
     def preview_zoom_out(self):
         if self.split_enabled and self.preview is not None:
             self.preview.setZoomFactor(max(0.4, self.preview.zoomFactor() - 0.1))
+
+    def _toggle_quick_open_start(self, checked):
+        settings = load_settings()
+        settings["show_quick_open_on_start"] = checked
+        save_settings(settings)
 
 
 def get_icon_path():
